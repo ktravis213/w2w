@@ -41,8 +41,8 @@ else:  # pragma: <3.9 cover
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    '''Add WUDAPT info to WRF's'''
-
+    '''Add WUDAPT info to WRF's - orig KRT'''
+    
     parser = argparse.ArgumentParser(
         description='PURPOSE: Add LCZ-based info to WRF geo_em.dXX.nc\n \n'
         'OUTPUT:\n'
@@ -134,6 +134,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         type=str,
         help='File with custom LCZ-based urban canopy parameters',
     )
+    parser.add_argument(
+        '--use-original-frc',
+        action='store_true',
+        help='Read FRC_URB2D from original WRF file instead of computing from LCZ',
+    )
 
     args = parser.parse_args(argv)
 
@@ -161,6 +166,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.lcz_ucp is not None:
         check_custom_ucp_table_integrity(ucp_table)
 
+    # Validate FRC_URB2D exists in original file if requested
+    if args.use_original_frc:
+        validate_original_frc_urb2d(info)
+
     # Get the required LCZ band to use
     LCZ_BAND = _get_lcz_band(info=info, args=args)
 
@@ -187,6 +196,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         FRC_THRESHOLD=args.FRC_THRESHOLD,
         LCZ_NAT_MASK=True,
         ucp_table=ucp_table,
+        use_original_frc=args.use_original_frc,
     )
 
     print(
@@ -246,6 +256,31 @@ class Info(NamedTuple):
             ),
             BUILT_LCZ=args.built_lcz,
         )
+
+
+def validate_original_frc_urb2d(info: Info) -> None:
+    '''
+    Validate that FRC_URB2D exists in the original WRF file
+    '''
+    ERROR = '\033[0;31m'
+    ENDC = '\033[0m'
+    
+    try:
+        wrf_data = xr.open_dataset(info.dst_file)
+        if 'FRC_URB2D' not in wrf_data.variables:
+            print(
+                f'{ERROR}ERROR: FRC_URB2D variable not found in original WRF file: '
+                f'{os.path.abspath(info.dst_file)}\n'
+                f'Cannot use --use-original-frc option.{ENDC}'
+            )
+            sys.exit(1)
+        else:
+            print('> FRC_URB2D found in original WRF file - will use original values')
+    except FileNotFoundError as exc:
+        print(
+            f'{ERROR}ERROR: cannot find WRF file: {os.path.abspath(info.dst_file)}{ENDC}'
+        )
+        raise SystemExit(exc)
 
 
 def _get_lcz_band(info: Info, args: argparse.Namespace) -> int:
@@ -658,6 +693,8 @@ def _get_wrf_grid_info(info: Info) -> Dict[str, Any]:
     }
 
     return wrf_grid_info
+
+
 
 
 def _get_SW_BW(ucp_table: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
@@ -1165,48 +1202,94 @@ def _add_frc_lu_index_2_wrf(
     FRC_THRESHOLD: float,
     LCZ_NAT_MASK: bool,
     ucp_table: pd.DataFrame,
+    use_original_frc: bool = False,
 ) -> xr.Dataset:
     '''
     Add FRC_URB2D and adjusted LCZ-based LU_INDEX to WRF file
     Also alters LANDUSEF and GREENFRAC in line with LU_INDEX
     '''
 
-    # Integrate FRC_URB2D
-    ucp_key = 'FRC_URB2D'
-
-    # Get the aggrated frc_urb values
-    frc_urb = _ucp_resampler(
-        info=info,
-        ucp_key=ucp_key,
-        RESAMPLE_TYPE='average',
-        ucp_table=ucp_table,
-        FRC_THRESHOLD=FRC_THRESHOLD,
-    )
-
     # Add to geo_em* that that has no urban
     dst_data = xr.open_dataset(info.dst_nu_file)
 
-    # Make a FRC_URB field and store aggregated data.
-    dst_data[ucp_key] = dst_data['LU_INDEX'].copy()
-    dst_data[ucp_key] = (('Time', 'south_north', 'west_east'), frc_urb.data)
+    # Always compute LCZ-based mapping to identify urban areas
+    lcz_data = rxr.open_rasterio(info.src_file_clean)[0, :, :]
+    
+    # Get mask of selected built LCZs
+    lcz_urb_mask = xr.DataArray(
+        np.isin(lcz_data, info.BUILT_LCZ).reshape(lcz_data.shape),
+        dims=lcz_data.dims,
+        coords=lcz_data.coords,
+    )
+    
+    # Get LCZ class values only for built areas
+    lcz_urban_only = lcz_data.where(lcz_urb_mask).copy()
+    
+    # Reproject to WRF grid to get LCZ values on WRF grid
+    wrf_grid_info = _get_wrf_grid_info(info)
+    lcz_2_wrf = reproject(
+        lcz_urban_only,
+        dst_data.LU_INDEX,
+        src_transform=lcz_data.rio.transform(),
+        src_crs=lcz_data.rio.crs,
+        dst_transform=wrf_grid_info['transform'],
+        dst_crs=wrf_grid_info['crs'],
+        resampling=Resampling['mode'],
+    )[0].values
+    
+    # Create mask of built LCZ areas on WRF grid
+    lcz_built_mask = ~np.isnan(lcz_2_wrf)
+    
+    # if LCZ 15 selected in 'BUILT_LCZ', rename to 11 for consistency
+    if 15 in info.BUILT_LCZ:
+        lcz_2_wrf[lcz_2_wrf == 15] = 11
+    
+    # Determine final FRC_URB2D
+    if use_original_frc:
+        # Read FRC_URB2D from original file
+        orig_data = xr.open_dataset(info.dst_file)
+        frc_urb_orig = orig_data['FRC_URB2D']
+        
+        # Start with zeros
+        frc_urb_final = np.zeros_like(dst_data.LU_INDEX.values)
+        
+        # Only use original FRC_URB2D where LCZ indicates built areas
+        frc_urb_final[0, lcz_built_mask[0, :, :]] = frc_urb_orig.values[0, lcz_built_mask[0, :, :]]
+        
+        print('> Using original FRC_URB2D values, masked to built LCZ areas only')
+    else:
+        # Compute from LCZ data
+        frc_urb_lcz = _ucp_resampler(
+            info=info,
+            ucp_key='FRC_URB2D',
+            RESAMPLE_TYPE='average',
+            ucp_table=ucp_table,
+            FRC_THRESHOLD=FRC_THRESHOLD,
+        )
+        frc_urb_final = frc_urb_lcz.values
+        print('> Using FRC_URB2D computed from LCZ data')
+
+    # Make a FRC_URB field and store final data
+    dst_data['FRC_URB2D'] = dst_data['LU_INDEX'].copy()
+    dst_data['FRC_URB2D'] = (('Time', 'south_north', 'west_east'), frc_urb_final)
 
     # Add proper attributes to the FRC_URB2D field
-    dst_data[ucp_key].attrs['FieldType'] = np.intc(104)
-    dst_data[ucp_key].attrs['MemoryOrder'] = 'XY'
-    dst_data[ucp_key].attrs['units'] = '-'
-    dst_data[ucp_key].attrs['description'] = 'ufrac'
-    dst_data[ucp_key].attrs['stagger'] = 'M'
-    dst_data[ucp_key].attrs['sr_x'] = np.intc(1)
-    dst_data[ucp_key].attrs['sr_y'] = np.intc(1)
+    dst_data['FRC_URB2D'].attrs['FieldType'] = np.intc(104)
+    dst_data['FRC_URB2D'].attrs['MemoryOrder'] = 'XY'
+    dst_data['FRC_URB2D'].attrs['units'] = '-'
+    dst_data['FRC_URB2D'].attrs['description'] = 'ufrac'
+    dst_data['FRC_URB2D'].attrs['stagger'] = 'M'
+    dst_data['FRC_URB2D'].attrs['sr_x'] = np.intc(1)
+    dst_data['FRC_URB2D'].attrs['sr_y'] = np.intc(1)
 
-    # Integrate LU_INDEX, also adjusts GREENFRAC and LANDUSEF
-    frc_mask, lcz_resampled = _lcz_resampler(
-        info=info,
-        frc_urb2d=dst_data['FRC_URB2D'],
-        LCZ_NAT_MASK=LCZ_NAT_MASK,
-    )
-
-    # 2) as LU_INDEX = 30 to 41, as LCZ classes.
+    # Use the mask of non-zero FRC_URB2D for consistency
+    frc_mask = dst_data['FRC_URB2D'].values[0, :, :] > 0
+    
+    # Create LCZ integer array for LU_INDEX (only where frc_mask is True)
+    lcz_values = lcz_2_wrf[0, frc_mask]
+    lcz_resampled = lcz_values + 30  # LCZ 1-11 -> LU_INDEX 31-41
+    
+    # Set LU_INDEX values
     dst_data['LU_INDEX'].values[0, frc_mask] = lcz_resampled
 
     # Also adjust GREENFRAC and LANDUSEF
@@ -1241,6 +1324,7 @@ def create_lcz_params_file(
     FRC_THRESHOLD: float,
     LCZ_NAT_MASK: bool,
     ucp_table: pd.DataFrame,
+    use_original_frc: bool = False,
 ) -> float:
     '''
     Create a domain file with all LCZ-based information:
@@ -1252,6 +1336,7 @@ def create_lcz_params_file(
         FRC_THRESHOLD=FRC_THRESHOLD,
         LCZ_NAT_MASK=LCZ_NAT_MASK,
         ucp_table=ucp_table,
+        use_original_frc=use_original_frc,
     )
 
     # Initialize empty URB_PARAM in final wrf file,
@@ -1264,6 +1349,7 @@ def create_lcz_params_file(
     # Define the UCPs that need to be integrated,
     # together with their positions (index starts at 1) in URB_PARAMS
     # HGT_URB2D and HI_URB2D follow a different approach, see further.
+
     ucp_dict = {
         'LP_URB2D': 91,
         'MH_URB2D': 92,
